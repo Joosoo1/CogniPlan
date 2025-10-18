@@ -63,14 +63,18 @@ class TestPolicyModel(unittest.TestCase):
         batch_size = 2
         seq_len = 10
         dummy_input = torch.randn(batch_size, seq_len, NODE_INPUT_DIM)
-        adj_mat = torch.ones(batch_size, seq_len, seq_len)
+        node_padding_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool)
+        edge_mask = torch.ones(batch_size, seq_len, seq_len)
+        current_index = torch.LongTensor([[0], [0]])  # Shape: [batch_size, 1]
+        current_edge = torch.arange(5).unsqueeze(0).repeat(batch_size, 1)  # Shape: [batch_size, 5]
+        edge_padding_mask = torch.zeros(batch_size, 5, dtype=torch.bool)
         
         # Test forward pass
         with torch.no_grad():
-            output = self.model(dummy_input, adj_mat)
+            output = self.model(dummy_input, node_padding_mask, edge_mask, current_index, current_edge, edge_padding_mask)
             
-        # Check output shape
-        self.assertEqual(output.shape, (batch_size, seq_len, 4))
+        # Check output shape - should be log probabilities for each action
+        self.assertEqual(output.shape, (batch_size, 5))
 
 
 class TestMapUtils(unittest.TestCase):
@@ -91,7 +95,7 @@ class TestMapUtils(unittest.TestCase):
             [0, 0, 0, 0, 0]
         ], dtype=np.int8)
         
-        map_info = MapInfo(test_map_data, 0.05, (-10.0, -10.0))
+        map_info = MapInfo(test_map_data, 0.0, 0.0, 0.05)
         self.assertIsInstance(map_info, MapInfo)
         self.assertEqual(map_info.map.shape, test_map_data.shape)
         

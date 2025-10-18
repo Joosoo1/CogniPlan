@@ -42,7 +42,9 @@ class SingleHeadAttention(nn.Module):
         U = self.tanh_clipping * torch.tanh(U)
 
         if mask is not None:
-            U = U.masked_fill(mask == 1, -6e4)
+            # Expand mask to match U dimensions: [n_batch, n_query, n_key]
+            mask_expanded = mask.unsqueeze(1).expand(-1, n_query, -1)
+            U = U.masked_fill(mask_expanded == 1, -6e4)
         attention = torch.log_softmax(U, dim=-1)  # n_batch*n_query*n_key
 
         return attention
@@ -84,13 +86,22 @@ class MultiHeadAttention(nn.Module):
         k_flat = k.contiguous().view(-1, n_dim)
         v_flat = v.contiguous().view(-1, n_dim)
         q_flat = q.contiguous().view(-1, n_dim)
-        shape_v = (self.n_heads, n_batch, n_value, -1)
-        shape_k = (self.n_heads, n_batch, n_key, -1)
-        shape_q = (self.n_heads, n_batch, n_query, -1)
-
-        Q = torch.matmul(q_flat, self.w_query).view(shape_q)  # n_heads*batch_size*n_query*key_dim
-        K = torch.matmul(k_flat, self.w_key).view(shape_k)  # n_heads*batch_size*targets_size*key_dim
-        V = torch.matmul(v_flat, self.w_value).view(shape_v)  # n_heads*batch_size*targets_size*value_dim
+        
+        # Fix the matrix multiplication by reshaping weights properly
+        # Reshape weights from [n_heads, n_dim, key_dim] to [n_dim, n_heads * key_dim]
+        w_query_reshaped = self.w_query.transpose(0, 1).contiguous().view(n_dim, self.n_heads * self.key_dim)
+        w_key_reshaped = self.w_key.transpose(0, 1).contiguous().view(n_dim, self.n_heads * self.key_dim)
+        w_value_reshaped = self.w_value.transpose(0, 1).contiguous().view(n_dim, self.n_heads * self.value_dim)
+        
+        # Apply linear transformation
+        Q_flat = torch.matmul(q_flat, w_query_reshaped)  # [n_batch*n_query, n_heads*key_dim]
+        K_flat = torch.matmul(k_flat, w_key_reshaped)    # [n_batch*n_key, n_heads*key_dim]
+        V_flat = torch.matmul(v_flat, w_value_reshaped)  # [n_batch*n_value, n_heads*value_dim]
+        
+        # Reshape to multi-head format
+        Q = Q_flat.view(n_batch, n_query, self.n_heads, self.key_dim).permute(2, 0, 1, 3)  # [n_heads, n_batch, n_query, key_dim]
+        K = K_flat.view(n_batch, n_key, self.n_heads, self.key_dim).permute(2, 0, 1, 3)    # [n_heads, n_batch, n_key, key_dim]
+        V = V_flat.view(n_batch, n_value, self.n_heads, self.value_dim).permute(2, 0, 1, 3)  # [n_heads, n_batch, n_value, value_dim]
 
         U = self.norm_factor * torch.matmul(Q, K.transpose(2, 3))  # n_heads*batch_size*n_query*targets_size
 
@@ -117,13 +128,13 @@ class MultiHeadAttention(nn.Module):
 
         heads = torch.matmul(attention, V)  # n_heads*batch_size*n_query*value_dim
 
-        # out = heads.permute(1, 2, 0, 3).reshape(n_batch, n_query, n_dim)
-        out = torch.mm(
-            heads.permute(1, 2, 0, 3).reshape(-1, self.n_heads * self.value_dim),
-            # batch_size*n_query*n_heads*value_dim
-            self.w_out.view(-1, self.embedding_dim)
-            # n_heads*value_dim*embedding_dim
-        ).view(-1, n_query, self.embedding_dim)
+        # Reshape heads for output projection
+        # heads: [n_heads, n_batch, n_query, value_dim]
+        heads_merged = heads.permute(1, 2, 0, 3).contiguous().view(n_batch * n_query, self.n_heads * self.value_dim)
+        
+        # Fix w_out usage - reshape properly for matrix multiplication
+        w_out_reshaped = self.w_out.transpose(0, 1).contiguous().view(self.n_heads * self.value_dim, self.embedding_dim)
+        out = torch.matmul(heads_merged, w_out_reshaped).view(n_batch, n_query, self.embedding_dim)
 
         return out, attention  # batch_size*n_query*embedding_dim
 
@@ -229,8 +240,9 @@ class PolicyNet(nn.Module):
 
     def decode_state(self, enhanced_node_feature, current_index, node_padding_mask):
         embedding_dim = enhanced_node_feature.size()[2]
-        current_node_feature = torch.gather(enhanced_node_feature, 1,
-                                                  current_index.repeat(1, 1, embedding_dim))
+        # Fix the repeat operation to properly expand current_index
+        current_index_expanded = current_index.unsqueeze(-1).expand(-1, -1, embedding_dim)
+        current_node_feature = torch.gather(enhanced_node_feature, 1, current_index_expanded)
         enhanced_current_node_feature, _ = self.decoder(current_node_feature,
                                                                     enhanced_node_feature,
                                                                     node_padding_mask)
@@ -243,8 +255,9 @@ class PolicyNet(nn.Module):
         current_state_feature = self.current_embedding(torch.cat((enhanced_current_node_feature,
                                                                 current_node_feature), dim=-1))
 
-        neighboring_feature = torch.gather(enhanced_node_feature, 1,
-                                           current_edge.repeat(1, 1, embedding_dim))
+        # Fix the repeat operation to properly expand current_edge
+        current_edge_expanded = current_edge.unsqueeze(-1).expand(-1, -1, embedding_dim)
+        neighboring_feature = torch.gather(enhanced_node_feature, 1, current_edge_expanded)
 
         logp = self.pointer(current_state_feature, neighboring_feature, edge_padding_mask)
         logp = logp.squeeze(1)
@@ -286,8 +299,9 @@ class QNet(nn.Module):
 
     def decode_state(self, enhanced_node_feature, current_index, node_padding_mask):
         embedding_dim = enhanced_node_feature.size()[2]
-        current_node_feature = torch.gather(enhanced_node_feature, 1,
-                                                  current_index.repeat(1, 1, embedding_dim))
+        # Fix the repeat operation to properly expand current_index
+        current_index_expanded = current_index.unsqueeze(-1).expand(-1, -1, embedding_dim)
+        current_node_feature = torch.gather(enhanced_node_feature, 1, current_index_expanded)
         enhanced_current_node_feature, _ = self.decoder(current_node_feature,
                                                                     enhanced_node_feature,
                                                                     node_padding_mask)
