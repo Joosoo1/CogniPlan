@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+
+"""
+ROS Node for CogniPlan Navigation
+Integrates trained CogniPlan models with ROS for robot navigation
+"""
+
+import rospy
+import torch
+import numpy as np
+from nav_msgs.msg import OccupancyGrid
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+import os
+import sys
+
+# Add the project root to Python path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from planner.model import PolicyNet, QNet
+from planner.parameter import NODE_INPUT_DIM, EMBEDDING_DIM, K_SIZE, NODE_PADDING_SIZE, USE_GPU_GLOBAL, FREE, UNKNOWN, UTILITY_RANGE
+from planner.utils import MapInfo, get_frontier_in_map, get_updating_node_coords, get_cell_position_from_coords
+
+
+class CogniPlanPlannerNode:
+    def __init__(self):
+        """Initialize the CogniPlan planner node"""
+        rospy.init_node('cogniplan_planner', anonymous=True)
+        
+        # Parameters
+        self.model_path = rospy.get_param('~model_path', 'checkpoints/cogniplan_exp_pred7_test')
+        self.use_gpu = rospy.get_param('~use_gpu', USE_GPU_GLOBAL)
+        self.device = torch.device('cuda' if self.use_gpu and torch.cuda.is_available() else 'cpu')
+        
+        # Robot state
+        self.map_data = None
+        self.laser_data = None
+        self.robot_pose = np.array([0.0, 0.0])  # x, y position
+        self.map_info = None
+        
+        # Load models
+        self.policy_net = None
+        self.q_net = None
+        self._load_models()
+        
+        # ROS Publishers and Subscribers
+        self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
+        self.map_sub = rospy.Subscriber('/map', OccupancyGrid, self.map_callback)
+        self.laser_sub = rospy.Subscriber('/scan', LaserScan, self.laser_callback)
+        self.odom_sub = rospy.Subscriber('/odom', Odometry, self.odom_callback)
+        
+        # Safety parameters
+        self.max_linear_vel = rospy.get_param('~max_linear_vel', 0.5)
+        self.max_angular_vel = rospy.get_param('~max_angular_vel', 1.0)
+        self.min_obstacle_distance = rospy.get_param('~min_obstacle_distance', 0.5)
+        
+        rospy.loginfo("CogniPlan Planner Node initialized")
+        
+    def _load_models(self):
+        """Load trained PolicyNet and QNet models"""
+        try:
+            # Initialize models
+            self.policy_net = PolicyNet(NODE_INPUT_DIM, EMBEDDING_DIM).to(self.device)
+            self.q_net = QNet(NODE_INPUT_DIM, EMBEDDING_DIM).to(self.device)
+            
+            # Load checkpoint files
+            policy_checkpoint = os.path.join(self.model_path, 'policy_net.pth')
+            q_checkpoint = os.path.join(self.model_path, 'q_net.pth')
+            
+            # Check if model path exists
+            if not os.path.exists(self.model_path):
+                rospy.logerr(f"Model path does not exist: {self.model_path}")
+                raise FileNotFoundError(f"Model path does not exist: {self.model_path}")
+            
+            # Load PolicyNet checkpoint
+            if os.path.exists(policy_checkpoint):
+                try:
+                    checkpoint = torch.load(policy_checkpoint, map_location=self.device)
+                    if 'model_state_dict' in checkpoint:
+                        self.policy_net.load_state_dict(checkpoint['model_state_dict'])
+                    else:
+                        # Handle case where checkpoint was saved directly
+                        self.policy_net.load_state_dict(checkpoint)
+                    self.policy_net.eval()
+                    rospy.loginfo(f"PolicyNet loaded successfully from {policy_checkpoint}")
+                    
+                    # Log additional checkpoint info if available
+                    if 'epoch' in checkpoint:
+                        rospy.loginfo(f"PolicyNet checkpoint epoch: {checkpoint['epoch']}")
+                    if 'loss' in checkpoint:
+                        rospy.loginfo(f"PolicyNet checkpoint loss: {checkpoint['loss']}")
+                except Exception as e:
+                    rospy.logerr(f"Failed to load PolicyNet checkpoint: {str(e)}")
+                    raise
+            else:
+                rospy.logerr(f"PolicyNet checkpoint not found at {policy_checkpoint}")
+                raise FileNotFoundError(f"PolicyNet checkpoint not found at {policy_checkpoint}")
+                
+            # Load QNet checkpoint
+            if os.path.exists(q_checkpoint):
+                try:
+                    checkpoint = torch.load(q_checkpoint, map_location=self.device)
+                    if 'model_state_dict' in checkpoint:
+                        self.q_net.load_state_dict(checkpoint['model_state_dict'])
+                    else:
+                        # Handle case where checkpoint was saved directly
+                        self.q_net.load_state_dict(checkpoint)
+                    self.q_net.eval()
+                    rospy.loginfo(f"QNet loaded successfully from {q_checkpoint}")
+                    
+                    # Log additional checkpoint info if available
+                    if 'epoch' in checkpoint:
+                        rospy.loginfo(f"QNet checkpoint epoch: {checkpoint['epoch']}")
+                    if 'loss' in checkpoint:
+                        rospy.loginfo(f"QNet checkpoint loss: {checkpoint['loss']}")
+                except Exception as e:
+                    rospy.logerr(f"Failed to load QNet checkpoint: {str(e)}")
+                    raise
+            else:
+                rospy.logerr(f"QNet checkpoint not found at {q_checkpoint}")
+                raise FileNotFoundError(f"QNet checkpoint not found at {q_checkpoint}")
+                
+            rospy.loginfo(f"Models loaded successfully on device: {self.device}")
+                
+        except Exception as e:
+            rospy.logerr(f"Failed to load models: {str(e)}")
+            raise
+    
+    def map_callback(self, msg):
+        """Callback for map data"""
+        try:
+            # Convert OccupancyGrid to numpy array
+            width = msg.info.width
+            height = msg.info.height
+            
+            # Validate dimensions
+            if width <= 0 or height <= 0:
+                rospy.logerr(f"Invalid map dimensions: {width}x{height}")
+                return
+                
+            map_array = np.array(msg.data).reshape((height, width))
+            
+            # Validate map data
+            if map_array.size == 0:
+                rospy.logerr("Empty map data received")
+                return
+            
+            # Create MapInfo object
+            self.map_info = MapInfo(
+                map=map_array,
+                map_origin_x=msg.info.origin.position.x,
+                map_origin_y=msg.info.origin.position.y,
+                cell_size=msg.info.resolution
+            )
+            
+            self.map_data = map_array
+            rospy.logdebug(f"Map data received and processed: {width}x{height}")
+            
+        except ValueError as e:
+            rospy.logerr(f"Error reshaping map data: {str(e)}")
+        except Exception as e:
+            rospy.logerr(f"Unexpected error processing map data: {str(e)}")
+    
+    def laser_callback(self, msg):
+        """Callback for laser scan data"""
+        try:
+            ranges = np.array(msg.ranges)
+            
+            # Validate laser data
+            if ranges.size == 0:
+                rospy.logwarn("Empty laser scan data received")
+                return
+                
+            # Check for valid range values
+            valid_ranges = ranges[np.isfinite(ranges)]
+            if len(valid_ranges) == 0:
+                rospy.logwarn("No valid laser readings in scan data")
+            
+            self.laser_data = {
+                'ranges': ranges,
+                'angle_min': msg.angle_min,
+                'angle_max': msg.angle_max,
+                'angle_increment': msg.angle_increment,
+                'range_min': msg.range_min,
+                'range_max': msg.range_max
+            }
+            rospy.logdebug(f"Laser scan data received: {ranges.size} points")
+            
+        except ValueError as e:
+            rospy.logerr(f"Error converting laser data: {str(e)}")
+        except Exception as e:
+            rospy.logerr(f"Unexpected error processing laser data: {str(e)}")
+    
+    def odom_callback(self, msg):
+        """Callback for odometry data"""
+        try:
+            # Extract robot pose from odometry
+            position = msg.pose.pose.position
+            self.robot_pose = np.array([position.x, position.y])
+            rospy.logdebug(f"Robot pose updated: x={position.x:.2f}, y={position.y:.2f}")
+            
+        except Exception as e:
+            rospy.logerr(f"Error processing odometry data: {str(e)}")
+    
+    def _ros_to_model_format(self):
+        """Convert ROS messages to model input format"""
+        if self.map_data is None or self.map_info is None:
+            rospy.logwarn("Map data not available")
+            return None
+            
+        try:
+            # Get frontiers from map
+            frontiers = get_frontier_in_map(self.map_info)
+            
+            # Get node coordinates
+            node_coords, free_connected_map = get_updating_node_coords(self.robot_pose, self.map_info)
+            
+            # Prepare node features
+            node_features = np.zeros((len(node_coords), NODE_INPUT_DIM))
+            for i, coord in enumerate(node_coords):
+                node_features[i, :2] = coord  # x, y coordinates
+                
+                # Find the closest frontier point to this node
+                if len(frontiers) > 0:
+                    distances = [np.linalg.norm(np.array(coord) - np.array(frontier)) for frontier in frontiers]
+                    min_dist = min(distances)
+                    node_features[i, 2] = min_dist  # Distance to nearest frontier
+                    
+                    # Utility value (simplified)
+                    if min_dist < UTILITY_RANGE and min_dist > 0:
+                        node_features[i, 3] = 1.0 / min_dist
+                    else:
+                        node_features[i, 3] = 0.0
+                        
+                # Add occupancy information
+                cell_pos = get_cell_position_from_coords(coord, self.map_info)
+                if (0 <= cell_pos[1] < self.map_info.map.shape[0] and 
+                    0 <= cell_pos[0] < self.map_info.map.shape[1]):
+                    cell_value = self.map_info.map[cell_pos[1], cell_pos[0]]
+                    node_features[i, 4] = 1.0 if cell_value == FREE else 0.0
+                    node_features[i, 5] = 1.0 if cell_value == UNKNOWN else 0.0
+            
+            # Pad nodes to fixed size for batching
+            num_nodes = len(node_coords)
+            if num_nodes < NODE_PADDING_SIZE:
+                padding = np.zeros((NODE_PADDING_SIZE - num_nodes, NODE_INPUT_DIM))
+                node_features = np.vstack([node_features, padding])
+                padded_num_nodes = NODE_PADDING_SIZE
+            else:
+                node_features = node_features[:NODE_PADDING_SIZE]
+                padded_num_nodes = NODE_PADDING_SIZE
+                num_nodes = NODE_PADDING_SIZE
+            
+            # Convert to tensors
+            node_inputs = torch.FloatTensor(node_features).unsqueeze(0).to(self.device)  # Add batch dimension
+            
+            # Create node padding mask
+            node_padding_mask = torch.ones((1, padded_num_nodes), dtype=torch.bool).to(self.device)
+            node_padding_mask[0, :num_nodes] = False  # False means not padded
+            
+            # Create edge mask (fully connected graph for now)
+            edge_mask = torch.zeros((1, padded_num_nodes, padded_num_nodes), dtype=torch.bool).to(self.device)
+            
+            # Find current robot position index among nodes
+            current_index = 0
+            min_dist_to_robot = float('inf')
+            for i, coord in enumerate(node_coords):
+                dist = np.linalg.norm(np.array(coord) - self.robot_pose)
+                if dist < min_dist_to_robot:
+                    min_dist_to_robot = dist
+                    current_index = i
+            
+            # Current index tensor
+            current_index_tensor = torch.LongTensor([[current_index]]).to(self.device)
+            
+            # Create k-nearest neighbors for current edge
+            k_nearest_indices = []
+            if len(node_coords) > 0:
+                distances = []
+                for i, coord in enumerate(node_coords):
+                    dist = np.linalg.norm(np.array(coord) - np.array(node_coords[current_index]))
+                    distances.append((dist, i))
+                
+                # Sort by distance and take K_SIZE nearest (excluding self)
+                distances.sort()
+                k_nearest_indices = [idx for _, idx in distances[1:K_SIZE+1]] if len(distances) > 1 else []
+                
+                # Pad if needed
+                if len(k_nearest_indices) < K_SIZE:
+                    k_nearest_indices.extend([0] * (K_SIZE - len(k_nearest_indices)))
+                elif len(k_nearest_indices) > K_SIZE:
+                    k_nearest_indices = k_nearest_indices[:K_SIZE]
+            
+            # Handle case where we don't have enough nodes
+            if len(k_nearest_indices) == 0:
+                k_nearest_indices = list(range(min(K_SIZE, padded_num_nodes)))
+                if len(k_nearest_indices) < K_SIZE:
+                    k_nearest_indices.extend([0] * (K_SIZE - len(k_nearest_indices)))
+            
+            # Current edge tensor
+            current_edge = torch.LongTensor(k_nearest_indices).unsqueeze(0).to(self.device)
+            
+            # Edge padding mask (all valid in this implementation)
+            edge_padding_mask = torch.zeros((1, K_SIZE), dtype=torch.bool).to(self.device)
+            
+            return {
+                'node_inputs': node_inputs,
+                'node_padding_mask': node_padding_mask,
+                'edge_mask': edge_mask,
+                'current_index': current_index_tensor,
+                'current_edge': current_edge,
+                'edge_padding_mask': edge_padding_mask
+            }
+            
+        except Exception as e:
+            rospy.logerr(f"Error converting ROS data to model format: {str(e)}")
+            return None
+    
+    def _check_safety_constraints(self):
+        """Check safety constraints before executing commands"""
+        safety_violations = []
+        
+        # Check laser data for obstacles
+        if self.laser_data is not None:
+            ranges = self.laser_data['ranges']
+            valid_ranges = ranges[np.isfinite(ranges)]
+            
+            if len(valid_ranges) > 0:
+                min_distance = np.min(valid_ranges)
+                if min_distance < self.min_obstacle_distance:
+                    safety_violations.append(f"Obstacle too close: {min_distance:.2f}m < {self.min_obstacle_distance:.2f}m")
+        
+        # Check if we have map data
+        if self.map_data is None or self.map_info is None:
+            safety_violations.append("No map data available")
+        
+        # Check if robot pose is valid
+        if np.isnan(self.robot_pose).any() or np.isinf(self.robot_pose).any():
+            safety_violations.append("Invalid robot pose")
+        
+        # Log any safety violations
+        if safety_violations:
+            for violation in safety_violations:
+                rospy.logwarn(f"Safety violation: {violation}")
+            return False
+            
+        return True
+    
+    def _validate_model_inputs(self, model_inputs):
+        """Validate model inputs before feeding to neural network"""
+        try:
+            # Check if all required keys are present
+            required_keys = ['node_inputs', 'node_padding_mask', 'edge_mask', 'current_index', 'current_edge', 'edge_padding_mask']
+            for key in required_keys:
+                if key not in model_inputs or model_inputs[key] is None:
+                    rospy.logerr(f"Missing required model input: {key}")
+                    return False
+            
+            # Check tensor dimensions
+            node_inputs = model_inputs['node_inputs']
+            node_padding_mask = model_inputs['node_padding_mask']
+            edge_mask = model_inputs['edge_mask']
+            current_index = model_inputs['current_index']
+            current_edge = model_inputs['current_edge']
+            edge_padding_mask = model_inputs['edge_padding_mask']
+            
+            # Validate node inputs
+            if len(node_inputs.shape) != 3:
+                rospy.logerr(f"Invalid node_inputs shape: {node_inputs.shape}")
+                return False
+                
+            # Validate node padding mask
+            if len(node_padding_mask.shape) != 2:
+                rospy.logerr(f"Invalid node_padding_mask shape: {node_padding_mask.shape}")
+                return False
+                
+            # Validate current index
+            if len(current_index.shape) != 2:
+                rospy.logerr(f"Invalid current_index shape: {current_index.shape}")
+                return False
+                
+            # Validate current edge
+            if len(current_edge.shape) != 2:
+                rospy.logerr(f"Invalid current_edge shape: {current_edge.shape}")
+                return False
+                
+            # Validate edge padding mask
+            if len(edge_padding_mask.shape) != 2:
+                rospy.logerr(f"Invalid edge_padding_mask shape: {edge_padding_mask.shape}")
+                return False
+                
+            rospy.logdebug("Model inputs validation passed")
+            return True
+            
+        except Exception as e:
+            rospy.logerr(f"Error validating model inputs: {str(e)}")
+            return False
+    
+    def _generate_motion_command(self, model_output):
+        """Generate motion command from model output"""
+        twist = Twist()
+        
+        if model_output is not None:
+            try:
+                # Extract policy probabilities and Q-values
+                policy_probs = model_output.get('policy', None)
+                q_values = model_output.get('q_values', None)
+                
+                if policy_probs is not None:
+                    # Convert to numpy for easier manipulation
+                    if isinstance(policy_probs, torch.Tensor):
+                        policy_probs = policy_probs.cpu().numpy()
+                    
+                    # Get the action with highest probability
+                    if len(policy_probs.shape) == 2:  # batch_size x num_actions
+                        action_probs = policy_probs[0]  # Take first batch item
+                        action_idx = np.argmax(action_probs)
+                    else:
+                        action_idx = 0  # Default action
+                    
+                    # Map action index to velocity commands
+                    # This is a simplified mapping - in practice, you would have a more sophisticated mapping
+                    # based on your action space definition
+                    
+                    # Normalize action index to a value between -1 and 1
+                    normalized_action = (action_idx / max(1, K_SIZE-1)) * 2 - 1 if K_SIZE > 1 else 0
+                    
+                    # Convert to velocity commands
+                    twist.linear.x = max(0.0, self.max_linear_vel * (1 - abs(normalized_action)))
+                    twist.angular.z = self.max_angular_vel * normalized_action
+                elif q_values is not None:
+                    # Use Q-values to select action
+                    if isinstance(q_values, torch.Tensor):
+                        q_values = q_values.cpu().numpy()
+                    
+                    # Get the action with highest Q-value
+                    if len(q_values.shape) == 3:  # batch_size x num_actions x 1
+                        action_values = q_values[0, :, 0]  # Take first batch item
+                        action_idx = np.argmax(action_values)
+                    else:
+                        action_idx = 0  # Default action
+                    
+                    # Map action index to velocity commands
+                    normalized_action = (action_idx / max(1, K_SIZE-1)) * 2 - 1 if K_SIZE > 1 else 0
+                    
+                    # Convert to velocity commands
+                    twist.linear.x = max(0.0, self.max_linear_vel * (1 - abs(normalized_action)))
+                    twist.angular.z = self.max_angular_vel * normalized_action
+                else:
+                    # If no valid model output, use simple obstacle avoidance
+                    twist = self._simple_obstacle_avoidance()
+            except Exception as e:
+                rospy.logerr(f"Error generating motion command: {str(e)}")
+                # Fallback to simple obstacle avoidance
+                twist = self._simple_obstacle_avoidance()
+        else:
+            # Safe default - stop
+            twist.linear.x = 0.0
+            twist.angular.z = 0.0
+            
+        return twist
+    
+    def _simple_obstacle_avoidance(self):
+        """Simple obstacle avoidance behavior when model output is not available"""
+        twist = Twist()
+        
+        if self.laser_data is not None:
+            ranges = self.laser_data['ranges']
+            valid_ranges = ranges[np.isfinite(ranges)]
+            
+            if len(valid_ranges) > 0:
+                min_distance = np.min(valid_ranges)
+                min_index = np.argmin(valid_ranges)
+                
+                # If obstacle is too close, stop and turn
+                if min_distance < self.min_obstacle_distance:
+                    twist.linear.x = 0.0
+                    # Turn away from obstacle
+                    if min_index < len(ranges) / 2:
+                        twist.angular.z = -self.max_angular_vel  # Turn right
+                    else:
+                        twist.angular.z = self.max_angular_vel   # Turn left
+                else:
+                    # Move forward if path is clear
+                    twist.linear.x = self.max_linear_vel * 0.5
+                    twist.angular.z = 0.0
+            else:
+                # No valid readings, move forward cautiously
+                twist.linear.x = self.max_linear_vel * 0.3
+                twist.angular.z = 0.0
+        else:
+            # No laser data, move forward slowly
+            twist.linear.x = self.max_linear_vel * 0.2
+            twist.angular.z = 0.0
+            
+        return twist
+    
+    def plan_and_execute(self):
+        """Main planning and execution loop"""
+        rate = rospy.Rate(10)  # 10 Hz
+        
+        while not rospy.is_shutdown():
+            try:
+                # Convert ROS data to model format
+                model_input = self._ros_to_model_format()
+                
+                if model_input is not None:
+                    # Validate model inputs
+                    if not self._validate_model_inputs(model_input):
+                        rospy.logerr("Model input validation failed")
+                        self._emergency_stop()
+                        continue
+                        
+                    # Run model inference
+                    try:
+                        with torch.no_grad():
+                            # Use policy net for action selection
+                            policy_output = self.policy_net(
+                                model_input['node_inputs'],
+                                model_input['node_padding_mask'],
+                                model_input['edge_mask'],
+                                model_input['current_index'],
+                                model_input['current_edge'],
+                                model_input['edge_padding_mask']
+                            )
+                            
+                            # Use Q net for value estimation
+                            q_output = self.q_net(
+                                model_input['node_inputs'],
+                                model_input['node_padding_mask'],
+                                model_input['edge_mask'],
+                                model_input['current_index'],
+                                model_input['current_edge'],
+                                model_input['edge_padding_mask']
+                            )
+                            
+                            # Combine outputs for decision making
+                            # This is simplified - you would need to implement your specific logic
+                            model_output = {
+                                'policy': policy_output,
+                                'q_values': q_output
+                            }
+                            
+                            # Log model outputs for debugging (at a lower frequency)
+                            if rospy.get_time() % 10 < 0.1:  # Log every ~10 seconds
+                                rospy.logdebug(f"Model output - Policy shape: {policy_output.shape if hasattr(policy_output, 'shape') else 'N/A'}, "
+                                             f"Q-values shape: {q_output.shape if hasattr(q_output, 'shape') else 'N/A'}")
+                            
+                    except Exception as e:
+                        rospy.logerr(f"Error during model inference: {str(e)}")
+                        # Fallback to simple obstacle avoidance
+                        model_output = None
+                        
+                        # Check safety constraints
+                        if self._check_safety_constraints():
+                            # Generate and publish motion command
+                            cmd = self._generate_motion_command(model_output)
+                            self.cmd_vel_pub.publish(cmd)
+                        else:
+                            # Emergency stop
+                            self._emergency_stop()
+                else:
+                    # No valid input, emergency stop
+                    self._emergency_stop()
+                    
+            except Exception as e:
+                rospy.logerr(f"Error in planning loop: {str(e)}")
+                # Emergency stop
+                self._emergency_stop()
+                
+            rate.sleep()
+    
+    def run(self):
+        """Run the planner node"""
+        rospy.spin()
+
+
+def main():
+    """Main function"""
+    try:
+        planner = CogniPlanPlannerNode()
+        planner.plan_and_execute()
+    except rospy.ROSInterruptException:
+        pass
+    except Exception as e:
+        rospy.logerr(f"Unhandled exception in main: {str(e)}")
+
+
+if __name__ == '__main__':
+    main()

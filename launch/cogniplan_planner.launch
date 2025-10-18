@@ -1,0 +1,10 @@
+<launch>
+    <!-- CogniPlan Planner Node -->
+    <node name="cogniplan_planner" pkg="cogniplan" type="cogniplan_planner_node.py" output="screen" respawn="true">
+        <rosparam command="load" file="$(find cogniplan)/config/cogniplan_planner.yaml" />
+        
+        <!-- Remap topics as needed -->
+        <!-- <remap from="input_topic" to="/robot/input_topic" /> -->
+        <!-- <remap from="output_topic" to="/robot/output_topic" /> -->
+    </node>
+</launch>
