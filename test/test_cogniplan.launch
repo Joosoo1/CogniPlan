@@ -1,0 +1,17 @@
+<launch>
+    <!-- Launch file for testing CogniPlan system -->
+
+    <!-- Load test parameters -->
+    <rosparam command="load" file="$(find cogniplan)/test/data/test_config.yaml" />
+
+    <!-- Launch the planner node in test mode -->
+    <node pkg="cogniplan" type="cogniplan_planner_node.py" name="cogniplan_planner_test" output="screen">
+        <!-- Test-specific parameters -->
+        <param name="test_mode" value="true" />
+        <param name="debug_mode" value="true" />
+    </node>
+
+    <!-- Test data publisher node -->
+    <node pkg="cogniplan" type="test_data_publisher.py" name="test_data_publisher" output="screen" />
+
+</launch>
