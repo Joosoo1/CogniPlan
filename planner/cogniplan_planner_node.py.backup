@@ -22,8 +22,7 @@ import torchvision.transforms as transforms
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from planner.model import PolicyNet, QNet
-from planner.parameter import NODE_INPUT_DIM, EMBEDDING_DIM, K_SIZE, NODE_PADDING_SIZE, USE_GPU_GLOBAL, FREE, UNKNOWN, \
-    UTILITY_RANGE, generator_path, N_GEN_SAMPLE, OCCUPIED
+from planner.parameter import NODE_INPUT_DIM, EMBEDDING_DIM, K_SIZE, NODE_PADDING_SIZE, USE_GPU_GLOBAL, FREE, UNKNOWN, UTILITY_RANGE, generator_path, N_GEN_SAMPLE
 from planner.utils import MapInfo, get_frontier_in_map, get_updating_node_coords, get_cell_position_from_coords
 # Import map prediction modules
 from mapinpaint.networks import Generator
@@ -85,7 +84,6 @@ def run():
     """Run the planner node"""
     rospy.spin()
 
-
 class CogniPlanPlannerNode:
     def __init__(self):
         """Initialize the CogniPlan planner node"""
@@ -123,100 +121,74 @@ class CogniPlanPlannerNode:
         rospy.loginfo("CogniPlan Planner Node initialized")
         
     def _load_models(self):
-        """Load trained PolicyNet, QNet and map predictor models"""
+        """Load trained PolicyNet and QNet models"""
         try:
-            # Initialize policy and Q networks
+            # Initialize models
             self.policy_net = PolicyNet(NODE_INPUT_DIM, EMBEDDING_DIM).to(self.device)
             self.q_net = QNet(NODE_INPUT_DIM, EMBEDDING_DIM).to(self.device)
             
             # Load checkpoint files
-            policy_checkpoint = os.path.join(self.model_path, 'checkpoint.pth')
+            policy_checkpoint = os.path.join(self.model_path, 'policy_net.pth')
+            q_checkpoint = os.path.join(self.model_path, 'q_net.pth')
             
             # Check if model path exists
             if not os.path.exists(self.model_path):
                 rospy.logerr(f"Model path does not exist: {self.model_path}")
                 raise FileNotFoundError(f"Model path does not exist: {self.model_path}")
             
-            # Load PolicyNet and QNet from main checkpoint
+            # Load PolicyNet checkpoint
             if os.path.exists(policy_checkpoint):
                 try:
                     checkpoint = torch.load(policy_checkpoint, map_location=self.device)
-                    # Load policy network
-                    if 'policy_model' in checkpoint:
-                        self.policy_net.load_state_dict(checkpoint['policy_model'])
+                    if 'model_state_dict' in checkpoint:
+                        self.policy_net.load_state_dict(checkpoint['model_state_dict'])
                     else:
+                        # Handle case where checkpoint was saved directly
                         self.policy_net.load_state_dict(checkpoint)
                     self.policy_net.eval()
                     rospy.loginfo(f"PolicyNet loaded successfully from {policy_checkpoint}")
                     
-                    # Load Q network
-                    if 'q_net1_model' in checkpoint:
-                        self.q_net.load_state_dict(checkpoint['q_net1_model'])
-                        rospy.loginfo("QNet loaded successfully from main checkpoint")
-                    elif 'q_net2_model' in checkpoint:
-                        self.q_net.load_state_dict(checkpoint['q_net2_model'])
-                        rospy.loginfo("QNet loaded successfully from main checkpoint")
-                        
-                    self.q_net.eval()
-                    
                     # Log additional checkpoint info if available
-                    if 'episode' in checkpoint:
-                        rospy.loginfo(f"Checkpoint episode: {checkpoint['episode']}")
+                    if 'epoch' in checkpoint:
+                        rospy.loginfo(f"PolicyNet checkpoint epoch: {checkpoint['epoch']}")
+                    if 'loss' in checkpoint:
+                        rospy.loginfo(f"PolicyNet checkpoint loss: {checkpoint['loss']}")
                 except Exception as e:
-                    rospy.logerr(f"Failed to load checkpoint: {str(e)}")
+                    rospy.logerr(f"Failed to load PolicyNet checkpoint: {str(e)}")
                     raise
             else:
-                rospy.logerr(f"Checkpoint not found at {policy_checkpoint}")
-                raise FileNotFoundError(f"Checkpoint not found at {policy_checkpoint}")
+                rospy.logerr(f"PolicyNet checkpoint not found at {policy_checkpoint}")
+                raise FileNotFoundError(f"PolicyNet checkpoint not found at {policy_checkpoint}")
                 
-            # Load map predictor (WGAN generator)
-            self.predictor = self._load_predictor()
-            
-            rospy.loginfo(f"All models loaded successfully on device: {self.device}")
+            # Load QNet checkpoint
+            if os.path.exists(q_checkpoint):
+                try:
+                    checkpoint = torch.load(q_checkpoint, map_location=self.device)
+                    if 'model_state_dict' in checkpoint:
+                        self.q_net.load_state_dict(checkpoint['model_state_dict'])
+                    else:
+                        # Handle case where checkpoint was saved directly
+                        self.q_net.load_state_dict(checkpoint)
+                    self.q_net.eval()
+                    rospy.loginfo(f"QNet loaded successfully from {q_checkpoint}")
+                    
+                    # Log additional checkpoint info if available
+                    if 'epoch' in checkpoint:
+                        rospy.loginfo(f"QNet checkpoint epoch: {checkpoint['epoch']}")
+                    if 'loss' in checkpoint:
+                        rospy.loginfo(f"QNet checkpoint loss: {checkpoint['loss']}")
+                except Exception as e:
+                    rospy.logerr(f"Failed to load QNet checkpoint: {str(e)}")
+                    raise
+            else:
+                rospy.logerr(f"QNet checkpoint not found at {q_checkpoint}")
+                raise FileNotFoundError(f"QNet checkpoint not found at {q_checkpoint}")
+                
+            rospy.loginfo(f"Models loaded successfully on device: {self.device}")
                 
         except Exception as e:
             rospy.logerr(f"Failed to load models: {str(e)}")
             raise
-    
-    def _load_predictor(self):
-        """Load the trained WGAN map predictor"""
-        try:
-            # Check if generator path exists
-            if not os.path.exists(self.generator_path):
-                rospy.logerr(f"Generator path does not exist: {self.generator_path}")
-                return None
-            
-            # Load config file
-            config_path = os.path.join(self.generator_path, 'config.yaml')
-            if not os.path.exists(config_path):
-                rospy.logerr(f"Config file not found at {config_path}")
-                return None
-                
-            with open(config_path, 'r') as stream:
-                config = yaml.load(stream, Loader=yaml.SafeLoader)
-            
-            # Find generator checkpoint file
-            gen_files = [f for f in os.listdir(self.generator_path) if f.startswith('gen') and f.endswith('.pt')]
-            if not gen_files:
-                rospy.logerr(f"No generator checkpoint found in {self.generator_path}")
-                return None
-                
-            checkpoint_path = os.path.join(self.generator_path, gen_files[0])
-            
-            # Initialize and load generator
-            generator = Generator(config['netG'], self.use_gpu)
-            generator.load_state_dict(torch.load(checkpoint_path, map_location=self.device))
-            generator.eval()
-            
-            # Create evaluator
-            predictor = Evaluator(config, generator, self.use_gpu, N_GEN_SAMPLE)
-            rospy.loginfo(f"Map predictor loaded successfully from {checkpoint_path}")
-            
-            return predictor
-            
-        except Exception as e:
-            rospy.logerr(f"Failed to load map predictor: {str(e)}")
-            return None
     
     def map_callback(self, msg):
         """Callback for map data"""
@@ -294,96 +266,6 @@ class CogniPlanPlannerNode:
         except Exception as e:
             rospy.logerr(f"Error processing odometry data: {str(e)}")
     
-    def _pre_process_input(self, map_info):
-        """Pre-process map input for the predictor"""
-        try:
-            width_in, height_in, _ = self.predictor.config['image_shape']
-            width_map, height_map = map_info.map.shape
-
-            pad = width_map < width_in and height_map < height_in
-            if pad:
-                pad_left = (width_in - width_map) // 2
-                pad_top = (height_in - height_map) // 2
-                pad_right = width_in - width_map - pad_left
-                pad_bottom = height_in - height_map - pad_top
-                belief = np.pad(map_info.map, ((pad_top, pad_bottom), (pad_left, pad_right)), mode='edge')
-            else:
-                belief = map_info.map
-            mask = belief.copy()
-            mask[mask != UNKNOWN] = 0
-            mask[mask == UNKNOWN] = FREE
-
-            x_raw = Image.fromarray(map_info.map).convert('L')
-            x_belief = Image.fromarray(belief).convert('L')
-            mask = Image.fromarray(mask).convert('1')
-            if not pad:
-                x_belief = transforms.Resize((width_in, height_in))(x_belief)
-                mask = transforms.Resize((width_in, height_in))(mask)
-            
-            # Convert to tensors
-            x_belief_tensor = transforms.ToTensor()(x_belief).unsqueeze(0).to(self.predictor.device)
-            x_belief_tensor = x_belief_tensor.mul_(2).add_(-1)
-            x_raw_tensor = transforms.ToTensor()(x_raw).unsqueeze(0).to(self.predictor.device)
-            x_raw_tensor = x_raw_tensor.mul_(2).add_(-1)
-            mask_tensor = transforms.ToTensor()(mask).unsqueeze(0).to(self.predictor.device)
-            
-            return x_belief_tensor, mask_tensor, x_raw_tensor
-            
-        except Exception as e:
-            rospy.logerr(f"Error pre-processing input for predictor: {str(e)}")
-            return None, None, None
-    
-    def _predict_map(self, map_info):
-        """Use the predictor to generate predicted maps"""
-        try:
-            if self.predictor is None:
-                rospy.logwarn("Predictor not available, using original map")
-                return map_info
-            
-            # Pre-process input
-            x_belief, mask, x_raw = self._pre_process_input(map_info)
-            if x_belief is None:
-                return map_info
-            
-            # Generate predictions
-            onehots = torch.tensor([[0.333, 0.333, 0.333], [1, 0, 0], [0, 1, 0], [0, 0, 1],
-                                    [0.6, 0.2, 0.2], [0.2, 0.6, 0.2], [0.2, 0.2, 0.6]]).unsqueeze(1).float().to(x_belief.device)
-            
-            predictions = []
-            for i in range(min(self.predictor.nsample, 4)):  # Limit to 4 samples for performance
-                try:
-                    _, x_inpaint = self.predictor.eval_step(x_belief, mask, onehots[i], map_info.map.shape)
-                    x_inpaint_processed = self.predictor.post_process(x_inpaint, x_raw, kernel_size=5)
-                    x_inpaint_processed = np.where(x_inpaint_processed > 0, FREE, UNKNOWN)
-                    predictions.append(x_inpaint_processed)
-                except Exception as e:
-                    rospy.logwarn(f"Error in prediction sample {i}: {str(e)}")
-                    continue
-            
-            if len(predictions) > 0:
-                # Use mean of predictions
-                pred_map = np.mean(predictions, axis=0)
-                # Convert to proper format
-                pred_map = np.where(pred_map > FREE/2, FREE, pred_map)
-                pred_map = np.where((pred_map <= FREE/2) & (pred_map > 0), UNKNOWN, pred_map)
-                pred_map = np.where(pred_map <= 0, OCCUPIED, pred_map)
-                
-                # Create new MapInfo with predicted map
-                pred_map_info = MapInfo(
-                    map=pred_map.astype(np.int8),
-                    map_origin_x=map_info.map_origin_x,
-                    map_origin_y=map_info.map_origin_y,
-                    cell_size=map_info.cell_size
-                )
-                return pred_map_info
-            else:
-                rospy.logwarn("No valid predictions generated, using original map")
-                return map_info
-                
-        except Exception as e:
-            rospy.logerr(f"Error predicting map: {str(e)}")
-            return map_info
-    
     def _ros_to_model_format(self):
         """Convert ROS messages to model input format"""
         if self.map_data is None or self.map_info is None:
@@ -391,14 +273,11 @@ class CogniPlanPlannerNode:
             return None
             
         try:
-            # Use map predictor to generate predicted map
-            pred_map_info = self._predict_map(self.map_info)
-            
-            # Get frontiers from predicted map
-            frontiers = get_frontier_in_map(pred_map_info)
+            # Get frontiers from map
+            frontiers = get_frontier_in_map(self.map_info)
             
             # Get node coordinates
-            node_coords, free_connected_map = get_updating_node_coords(self.robot_pose, pred_map_info)
+            node_coords, free_connected_map = get_updating_node_coords(self.robot_pose, self.map_info)
             
             # Prepare node features
             node_features = np.zeros((len(node_coords), NODE_INPUT_DIM))
@@ -408,27 +287,20 @@ class CogniPlanPlannerNode:
                 # Find the closest frontier point to this node
                 if len(frontiers) > 0:
                     distances = [np.linalg.norm(np.array(coord) - np.array(frontier)) for frontier in frontiers]
-                    if distances:
-                        min_dist = min(distances)
-                        node_features[i, 2] = min_dist  # Distance to nearest frontier
-                        
-                        # Utility value
-                        if UTILITY_RANGE > min_dist > 0:
-                            node_features[i, 3] = 1.0 / min_dist
-                        else:
-                            node_features[i, 3] = 0.0
-                    else:
-                        node_features[i, 2] = 0.0
-                        node_features[i, 3] = 0.0
-                else:
-                    node_features[i, 2] = 0.0
-                    node_features[i, 3] = 0.0
+                    min_dist = min(distances)
+                    node_features[i, 2] = min_dist  # Distance to nearest frontier
                     
+                    # Utility value (simplified)
+                    if UTILITY_RANGE > min_dist > 0:
+                        node_features[i, 3] = 1.0 / min_dist
+                    else:
+                        node_features[i, 3] = 0.0
+                        
                 # Add occupancy information
-                cell_pos = get_cell_position_from_coords(coord, pred_map_info)
-                if (0 <= cell_pos[1] < pred_map_info.map.shape[0] and 
-                    0 <= cell_pos[0] < pred_map_info.map.shape[1]):
-                    cell_value = pred_map_info.map[cell_pos[1], cell_pos[0]]
+                cell_pos = get_cell_position_from_coords(coord, self.map_info)
+                if (0 <= cell_pos[1] < self.map_info.map.shape[0] and 
+                    0 <= cell_pos[0] < self.map_info.map.shape[1]):
+                    cell_value = self.map_info.map[cell_pos[1], cell_pos[0]]
                     node_features[i, 4] = 1.0 if cell_value == FREE else 0.0
                     node_features[i, 5] = 1.0 if cell_value == UNKNOWN else 0.0
             
@@ -482,6 +354,12 @@ class CogniPlanPlannerNode:
                     k_nearest_indices.extend([0] * (K_SIZE - len(k_nearest_indices)))
                 elif len(k_nearest_indices) > K_SIZE:
                     k_nearest_indices = k_nearest_indices[:K_SIZE]
+            
+            # Handle case where we don't have enough nodes
+            if len(k_nearest_indices) == 0:
+                k_nearest_indices = list(range(min(K_SIZE, padded_num_nodes)))
+                if len(k_nearest_indices) < K_SIZE:
+                    k_nearest_indices.extend([0] * (K_SIZE - len(k_nearest_indices)))
             
             # Current edge tensor
             current_edge = torch.LongTensor(k_nearest_indices).unsqueeze(0).to(self.device)
@@ -641,40 +519,51 @@ class CogniPlanPlannerNode:
                 model_input = self._ros_to_model_format()
                 
                 if model_input is not None:
-                    # Validate inputs
+                    # Validate model inputs
                     if not _validate_model_inputs(model_input):
-                        rospy.logerr("Invalid model inputs, skipping planning step")
-                        rate.sleep()
+                        rospy.logerr("Model input validation failed")
+                        self._emergency_stop()
                         continue
-                    
+                        
                     # Run model inference
-                    with torch.no_grad():
-                        # Use policy net for action selection
-                        policy_output = self.policy_net(
-                            model_input['node_inputs'],
-                            model_input['node_padding_mask'],
-                            model_input['edge_mask'],
-                            model_input['current_index'],
-                            model_input['current_edge'],
-                            model_input['edge_padding_mask']
-                        )
-                        
-                        # Use Q net for value estimation
-                        q_output = self.q_net(
-                            model_input['node_inputs'],
-                            model_input['node_padding_mask'],
-                            model_input['edge_mask'],
-                            model_input['current_index'],
-                            model_input['current_edge'],
-                            model_input['edge_padding_mask']
-                        )
-                        
-                        # Combine outputs for decision-making
-                        # This is simplified - you would need to implement your specific logic
-                        model_output = {
-                            'policy': policy_output,
-                            'q_values': q_output
-                        }
+                    try:
+                        with torch.no_grad():
+                            # Use policy net for action selection
+                            policy_output = self.policy_net(
+                                model_input['node_inputs'],
+                                model_input['node_padding_mask'],
+                                model_input['edge_mask'],
+                                model_input['current_index'],
+                                model_input['current_edge'],
+                                model_input['edge_padding_mask']
+                            )
+                            
+                            # Use Q net for value estimation
+                            q_output = self.q_net(
+                                model_input['node_inputs'],
+                                model_input['node_padding_mask'],
+                                model_input['edge_mask'],
+                                model_input['current_index'],
+                                model_input['current_edge'],
+                                model_input['edge_padding_mask']
+                            )
+                            
+                            # Combine outputs for decision-making
+                            # This is simplified - you would need to implement your specific logic
+                            model_output = {
+                                'policy': policy_output,
+                                'q_values': q_output
+                            }
+                            
+                            # Log model outputs for debugging (at a lower frequency)
+                            if rospy.get_time() % 10 < 0.1:  # Log every ~10 seconds
+                                rospy.logdebug(f"Model output - Policy shape: {policy_output.shape if hasattr(policy_output, 'shape') else 'N/A'}, "
+                                             f"Q-values shape: {q_output.shape if hasattr(q_output, 'shape') else 'N/A'}")
+                            
+                    except Exception as e:
+                        rospy.logerr(f"Error during model inference: {str(e)}")
+                        # Fallback to simple obstacle avoidance
+                        model_output = None
                         
                         # Check safety constraints
                         if self._check_safety_constraints():
@@ -683,20 +572,20 @@ class CogniPlanPlannerNode:
                             self.cmd_vel_pub.publish(cmd)
                         else:
                             # Emergency stop
-                            stop_cmd = Twist()
-                            self.cmd_vel_pub.publish(stop_cmd)
+                            self._emergency_stop()
                 else:
-                    # No valid input, stop robot
-                    stop_cmd = Twist()
-                    self.cmd_vel_pub.publish(stop_cmd)
+                    # No valid input, emergency stop
+                    self._emergency_stop()
                     
             except Exception as e:
                 rospy.logerr(f"Error in planning loop: {str(e)}")
                 # Emergency stop
-                stop_cmd = Twist()
-                self.cmd_vel_pub.publish(stop_cmd)
+                self._emergency_stop()
                 
             rate.sleep()
+
+    def _emergency_stop(self):
+        pass
 
 
 def main():

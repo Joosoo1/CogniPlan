@@ -2,6 +2,68 @@
 
 A ROS implementation of the CogniPlan navigation system that integrates trained deep reinforcement learning models for robot path planning.
 
+## Algorithm Flow
+
+```mermaid
+flowchart TD
+    A[开始] --> B[接收传感器数据]
+    B --> C[构建占据栅格地图]
+    C --> D[地图预测模块]
+    D --> E[WGAN生成模型]
+    E --> F[多样本地图预测]
+    F --> G[预测地图融合]
+    G --> H[前沿点提取]
+    H --> I[图结构构建]
+    I --> J[节点特征计算]
+    J --> K[Transformer图神经网络]
+    K --> L[策略网络PolicyNet]
+    L --> M[动作概率输出]
+    K --> N[Q值网络QNet]
+    N --> O[状态价值评估]
+    M --> P[动作选择]
+    O --> P
+    P --> Q[生成速度命令]
+    Q --> R[发布到/cmd_vel]
+    R --> S[机器人执行]
+    S --> B
+    
+    subgraph 传感器数据处理
+        B
+        C
+    end
+    
+    subgraph 地图预测
+        D
+        E
+        F
+        G
+    end
+    
+    subgraph 路径规划
+        H
+        I
+        J
+        K
+        L
+        M
+        N
+        O
+        P
+    end
+    
+    subgraph 运动控制
+        Q
+        R
+        S
+    end
+    
+    style D fill:#e1f5fe
+    style E fill:#f3e5f5
+    style K fill:#fff3e0
+    style L fill:#ffebee
+    style N fill:#ffebee
+```
+
 ## Package Structure
 
 ```

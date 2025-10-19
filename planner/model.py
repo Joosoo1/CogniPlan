@@ -314,8 +314,9 @@ class QNet(nn.Module):
         k_size = current_edge.size()[1]
         current_state_feature = torch.cat((enhanced_current_node_feature, current_node_feature), dim=-1)
 
-        neighboring_feature = torch.gather(enhanced_node_feature, 1,
-                                           current_edge.repeat(1, 1, embedding_dim))
+        # Fix the repeat operation to properly expand current_edge
+        current_edge_expanded = current_edge.unsqueeze(-1).expand(-1, -1, embedding_dim)
+        neighboring_feature = torch.gather(enhanced_node_feature, 1, current_edge_expanded)
 
         action_features = torch.cat((current_state_feature.repeat(1, k_size, 1), neighboring_feature), dim=-1)
         q_values = self.q_values_layer(action_features)

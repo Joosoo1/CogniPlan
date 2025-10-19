@@ -1,8 +1,9 @@
 # CogniPlan Planner Node Configuration
 
 # Model parameters
-model_path: "checkpoints/cogniplan_exp_pred7_test"
-use_gpu: true
+model_path: "checkpoints/cogniplan_exp_pred7"
+generator_path: "checkpoints/wgan_inpainting"
+use_gpu: false
 model_input_size: [224, 224]  # [height, width]
 
 # Velocity limits
