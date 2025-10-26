@@ -1,6 +1,6 @@
 # CogniPlan ROS Package
 
-A ROS implementation of the CogniPlan navigation system that integrates trained deep reinforcement learning models for robot path planning.
+A ROS implementation of the CogniPlan navigation system that integrates trained deep reinforcement learning models for robot path planning in unknown environments.
 
 ## Algorithm Flow
 
@@ -104,14 +104,17 @@ cogniplan/
 
 ## Overview
 
-CogniPlan is a cognitive planning system that uses deep reinforcement learning to navigate robots in unknown environments. This package provides a ROS node that integrates trained PolicyNet and QNet models with standard ROS navigation messages.
+CogniPlan is an advanced cognitive planning system that uses deep reinforcement learning and predictive mapping to navigate robots in unknown environments. This package provides a ROS node that integrates trained PolicyNet and QNet models with a WGAN-based map predictor, enabling intelligent exploration and path planning in dynamic environments.
 
 ## Features
 
 - Integration with trained CogniPlan models (PolicyNet and QNet)
+- WGAN-based predictive mapping for unknown environments
+- Transformer graph neural network for spatial reasoning
 - Subscribes to standard ROS topics:
   - `/map` (nav_msgs/OccupancyGrid)
   - `/scan` (sensor_msgs/LaserScan)
+  - `/odom` (nav_msgs/Odometry)
 - Publishes motion commands to `/cmd_vel` (geometry_msgs/Twist)
 - Supports both CPU and GPU execution
 - Implements safety constraints and emergency stopping
@@ -184,6 +187,7 @@ Parameters are configured in `config/cogniplan_planner.yaml`:
 The system expects the following model files in the checkpoints directory:
 - `policy_net.pth`: Trained PolicyNet model
 - `q_net.pth`: Trained QNet model
+- `gen_X.pt`: Trained WGAN generator model for map prediction
 
 ## Node Details
 
@@ -191,6 +195,7 @@ The system expects the following model files in the checkpoints directory:
 
 - `/map` (nav_msgs/OccupancyGrid): Map data from SLAM or static map server
 - `/scan` (sensor_msgs/LaserScan): Laser scan data from robot sensors
+- `/odom` (nav_msgs/Odometry): Robot odometry data
 
 ### Published Topics
 
