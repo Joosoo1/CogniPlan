@@ -3,7 +3,7 @@ dataset/maps_train/
 dataset/maps_eval/
 dataset/maps_train_inpaint/
 dataset/maps_eval_inpaint/
-dataset/.cache/
+dataset/*
 
 *.pt
 *.pth
